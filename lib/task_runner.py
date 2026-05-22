@@ -20,8 +20,7 @@
   )
 """
 
-import argparse, asyncio, json, os, socket, subprocess, sys, time, traceback
-from datetime import datetime
+import asyncio, json, socket, sys, time, traceback
 from pathlib import Path
 
 # ─── 路径适配 ────────────────────────────────────
@@ -521,7 +520,7 @@ def run_with_retry(profile_id: str, phases: list[dict], max_retries: int = 3):
             print(f"{'='*50}", flush=True)
 
         # ── 并行启动: LLM 检查 + AdsPower + SSH 隧道 ⚡ ──
-        print(f"\n[2/7] ⚡ 并行启动 (LLM 检查 + AdsPower + 隧道)...", flush=True)
+        print(f"\n⚡ 并行启动 (LLM 检查 + AdsPower + 隧道)...", flush=True)
         try:
             llm_ok, cdp_info, local_port, local_cdp, tunnel_proc = (
                 asyncio.run(_startup_parallel(profile_id))
@@ -542,7 +541,7 @@ def run_with_retry(profile_id: str, phases: list[dict], max_retries: int = 3):
             continue
 
         # ── 组装 prompt + 跑 agent ──
-        print(f"\n[5/7] 🧩 组装阶段任务 + 启动 Agent...", flush=True)
+        print(f"\n🧩 组装阶段任务 + 启动 Agent...", flush=True)
         print(f"   📄 {len(phases)} 个阶段: {[p['name'] for p in phases]}", flush=True)
         print(f"   🤖 bu-30b @ local RTX 4090", flush=True)
 

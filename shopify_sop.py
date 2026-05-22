@@ -21,7 +21,7 @@ Shopify 自动注册 SOP — 标准操作程序
   不在代码中硬编码任何密钥。
 """
 
-import argparse, asyncio, json, os, sys, traceback
+import argparse, json
 from pathlib import Path
 
 # ─── 路径适配 ────────────────────────────────────
@@ -34,16 +34,11 @@ FEISHU_SHEET_REGIS = "T8Za6f"   # 注册资料 sheetId
 FEISHU_SHEET_PROMPT = "0Uq2PS"  # 自动化prompt sheetId
 FEISHU_SHEET_EXP = "11xbRm"     # 经验库 sheetId
 
-MAX_STEPS = 100
-TUNNEL_WAIT = 4.0
-
 # ─── 从通用引擎导入 ──────────────────────────────
 from lib.task_runner import (
     _init_config,
     read_registration_data,
-    read_prompt,
     update_feishu_status,
-    sync_experience_from_feishu,
     sync_experience_to_feishu,
     stop_profile,
     run_with_retry,
@@ -299,7 +294,8 @@ def main():
     print(f"   🎯 找到: {target.get('配置文件名称', '未知')} ({target.get('邮箱', '')})", flush=True)
     update_feishu_status(target_idx, "注册中...", FEISHU_SHEET_REGIS)
 
-    # ── 2-4. 带重试的并行启动循环 ──
+    # ── 2-5. 并行启动 + Agent 执行（含重试）──
+    print("\n[2/8] ⚡ 并行启动 + Agent 执行（含重试）...", flush=True)
     # 提前解析 profile_id
     profile_name = target.get("配置文件名称", "")
     profile_id = "k1cl9nd6"  # fallback
@@ -315,7 +311,7 @@ def main():
     if success:
         result = final or "无结果"
         # ── 6. 更新飞书 ──
-        print(f"\n[6/7] ✏️  更新飞书状态 + 安排后续任务...", flush=True)
+        print(f"\n[6/8] ✏️  更新飞书状态 + 安排后续任务...", flush=True)
         if "admin" in result.lower() or "dashboard" in result.lower() or "complete" in result.lower():
             update_feishu_status(target_idx, "已注册+已安装Syncee ✅", FEISHU_SHEET_REGIS)
             print("   ✅ 已标记为完成", flush=True)
@@ -339,18 +335,18 @@ def main():
             print("   📝 已记录经验补丁", flush=True)
     else:
         # ── 失败处理 ──
-        print(f"\n[6/7] ❌ 执行失败，记录经验...", flush=True)
+        print(f"\n[6/8] ❌ 执行失败，记录经验...", flush=True)
         patches = load_experience()
         add_experience(patches, f"失败步骤: {str(error)[:30]}", f"此步骤出错: {error}")
-        save_experience(patches)
 
         # 已由 run_with_retry 标记为失败 - 更新最终状态
         if error:
             update_feishu_status(target_idx, f"失败(3次): {str(error)[:50]}", FEISHU_SHEET_REGIS)
-            patches = load_experience()
             add_experience(patches, "最终失败(3次)", f"重试耗尽: {error}")
-            sync_experience_to_feishu(FEISHU_SHEET_EXP, EXPERIENCE_FILE)
-            print("   📝 已同步错误到飞书经验库", flush=True)
+
+        save_experience(patches)
+        sync_experience_to_feishu(FEISHU_SHEET_EXP, EXPERIENCE_FILE)
+        print("   📝 已同步错误到飞书经验库", flush=True)
 
     print('\n' + '=' * 60)
     print(' 🏁  SOP 执行完毕')
