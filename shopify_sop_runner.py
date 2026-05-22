@@ -404,6 +404,50 @@ def check_llm_alive() -> bool:
     except Exception:
         return False
 
+
+# ─── 并行启动 ⚡ ──────────────────────────────────
+
+async def _startup_parallel(profile_id: str):
+    """并行执行 LLM 检查 + AdsPower 启动 + SSH 隧道。
+
+    LLM 健康检查独立，AdsPower 启动后立即触发隧道建立。
+    预期：串行 6-11s → 并行 3-5s。
+
+    返回: (llm_ok, cdp_info, local_port, local_cdp, tunnel_proc)
+    任一步失败抛出异常 → 调用方终止本次 attempt。
+    """
+    import httpx
+
+    async def _check_llm_async():
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                r = await c.get(f"{_llm_base_url}/models")
+                return r.status_code == 200
+        except Exception:
+            return False
+
+    async def _start_ads_async():
+        loop = asyncio.get_event_loop()
+        fix_profile_sys(profile_id)
+        return await loop.run_in_executor(None, start_adsprofile, profile_id)
+
+    # ── Phase 1: LLM 检查 + AdsPower 启动 并行 ──
+    llm_task = asyncio.create_task(_check_llm_async())
+    ads_task = asyncio.create_task(_start_ads_async())
+
+    llm_ok, cdp_info = await asyncio.gather(llm_task, ads_task)
+
+    if not llm_ok:
+        raise Exception("LLM 服务不可用 (BU-30b)")
+
+    # ── Phase 2: SSH 隧道 (依赖 AdsPower 结果) ──
+    loop = asyncio.get_event_loop()
+    local_port, local_cdp, tunnel_proc = await loop.run_in_executor(
+        None, build_tunnel, cdp_info["cdp_url"]
+    )
+
+    return llm_ok, cdp_info, local_port, local_cdp, tunnel_proc
+
 # ─── 任务阶段定义 ──────────────────────────────
 # 每个阶段独立 prompt → 独立的 LLM 上下文，不再互相污染
 # 只带当前阶段必要的信息，不背前面几十步的历史包袱
@@ -703,54 +747,42 @@ def main():
     print(f"   🎯 找到: {target.get('配置文件名称', '未知')} ({target.get('邮箱', '')})", flush=True)
     update_feishu_status(target_idx, "注册中...")
 
-    # ── 2. 检查 LLM 服务 ──
-    print(f"\n[2/7] 🌐 检查 LLM 服务 (BU-30b)...", flush=True)
-    if not check_llm_alive():
-        print("⚠️  BU-30b 不可用！请确认 llama-server 正在运行", flush=True)
-        print(f"   检测地址: {_llm_base_url}/models", flush=True)
-        update_feishu_status(target_idx, "失败: LLM断连")
-        return
-    print(f"   ✅ {_llm_base_url}", flush=True)
-
-    # ── 3-5. 带重试的执行循环 ──
+    # ── 2-4. 带重试的并行启动循环 ──
     MAX_RETRIES = 3
     last_error = None
-    
+
+    # 提前解析 profile_id
+    profile_name = target.get("配置文件名称", "")
+    profile_id = "k1cl9nd6"  # fallback
+    if profile_name and "(" in profile_name and ")" in profile_name:
+        profile_id = profile_name.split("(")[1].split(")")[0]
+
     for attempt in range(1, MAX_RETRIES + 1):
         if attempt > 1:
             print(f"\n{'='*50}", flush=True)
             print(f" 🔄 第 {attempt}/{MAX_RETRIES} 次重试", flush=True)
             print(f"{'='*50}", flush=True)
-        
-        print(f"\n[3/7] 🚀 启动 AdsPower 配置...", flush=True)
-        profile_name = target.get("配置文件名称", "")
-        profile_id = "k1cl9nd6"  # fallback
-        if profile_name and "(" in profile_name and ")" in profile_name:
-            profile_id = profile_name.split("(")[1].split(")")[0]
+
+        # ── 并行启动: LLM 检查 + AdsPower + SSH 隧道 ⚡ ──
+        print(f"\n[2/7] ⚡ 并行启动 (LLM 检查 + AdsPower + 隧道)...", flush=True)
         try:
-            # 先确保系统设置正确 (OS=win, 1280×1080)
-            fix_profile_sys(profile_id)
-            cdp_info = start_adsprofile(profile_id)
+            llm_ok, cdp_info, local_port, local_cdp, tunnel_proc = (
+                asyncio.run(_startup_parallel(profile_id))
+            )
+            print(f"   ✅ LLM: {_llm_base_url}", flush=True)
             print(f"   ✅ Profile: {profile_id}", flush=True)
             print(f"   🔗 CDP: {cdp_info['cdp_url'][:60]}...", flush=True)
-        except Exception as e:
-            print(f"   ❌ AdsPower 启动失败: {e}", flush=True)
-            if attempt == MAX_RETRIES:
-                update_feishu_status(target_idx, f"失败: {e}")
-            continue
-
-        # ── 4. 建 SSH 隧道 ──
-        print(f"\n[4/7] 🔌 建 SSH 隧道...", flush=True)
-        tunnel_proc = None
-        try:
-            local_port, local_cdp, tunnel_proc = build_tunnel(cdp_info["cdp_url"])
             print(f"   ✅ Tunnel: 127.0.0.1:{local_port} → Windows:{cdp_info['debug_port']}", flush=True)
             print(f"   🔗 Local CDP: {local_cdp[:80]}...", flush=True)
         except Exception as e:
-            print(f"   ❌ 隧道创建失败: {e}", flush=True)
-            _stop_profile(profile_id, _adspower_base, _adspower_api_key)
+            print(f"   ❌ 启动失败: {e}", flush=True)
+            # 尝试清理 AdsPower（可能已部分启动）
+            try:
+                _stop_profile(profile_id, _adspower_base, _adspower_api_key)
+            except Exception:
+                pass
             if attempt == MAX_RETRIES:
-                update_feishu_status(target_idx, f"失败: 隧道{e}")
+                update_feishu_status(target_idx, f"失败: 启动{e}")
             continue
 
         # ── 5. 组装 prompt + 跑 agent ──

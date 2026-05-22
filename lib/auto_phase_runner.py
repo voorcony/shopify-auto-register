@@ -55,8 +55,9 @@ class AutoPhaseRunner:
         llm_config: ChatOpenAI 构造参数
         cdp_url: AdsPower CDP WebSocket URL
         viewport: 浏览器视口
-        max_steps_per_phase: 每阶段最大步数 (默认 18, BU-30b 16K 窗口)
-        max_phases: 最大阶段数 (默认 6 = 108 步)
+        max_steps_per_phase: 每阶段最大步数 (默认 30，硬上限兜底)
+        max_tokens_per_phase: 每阶段最大 token 数 (默认 14000，BU-30b 16K 窗口留 2000 缓冲)
+        max_phases: 最大阶段数 (默认 6 = 180 步)
         verbose: 打印详细日志
     """
 
@@ -65,7 +66,8 @@ class AutoPhaseRunner:
         llm_config: dict[str, Any],
         cdp_url: str,
         viewport: dict | None = None,
-        max_steps_per_phase: int = 18,
+        max_steps_per_phase: int = 30,
+        max_tokens_per_phase: int = 14000,
         max_phases: int = 6,
         verbose: bool = True,
     ):
@@ -73,6 +75,7 @@ class AutoPhaseRunner:
         self.cdp_url = cdp_url
         self.viewport = viewport or {"width": 1280, "height": 1080}
         self.max_steps_per_phase = max_steps_per_phase
+        self.max_tokens_per_phase = max_tokens_per_phase
         self.max_phases = max_phases
         self.verbose = verbose
 
@@ -167,12 +170,20 @@ class AutoPhaseRunner:
         task: str,
         phase_idx: int,
     ) -> dict:
-        """执行单个阶段，返回结果字典。"""
+        """执行单个阶段，返回结果字典。
+
+        使用手动 step 循环 (替代 agent.run()) 实现动态 token 跟踪：
+        - 每步后实时累计 prompt + completion tokens
+        - 当 token 消耗超过 max_tokens_per_phase 时主动切阶段
+        - max_steps_per_phase 作为硬上限兜底
+        - 任务完成 (is_done) 优先于 token 限制
+        """
         from browser_use.llm.openai.chat import ChatOpenAI
         from browser_use import Agent
 
         phase_label = f"Phase {phase_idx+1}"
-        self._log(f"{phase_label} — max {self.max_steps_per_phase} steps")
+        self._log(f"{phase_label} — max {self.max_steps_per_phase} steps, "
+                  f"budget {self.max_tokens_per_phase:,} tokens")
 
         llm = ChatOpenAI(**self.llm_config)
 
@@ -187,45 +198,85 @@ class AutoPhaseRunner:
         )
 
         start_ts = time.time()
+        phase_prompt = 0
+        phase_completion = 0
+        steps = 0
+        stopped_by_token_limit = False
+
         try:
-            history = await agent.run(max_steps=self.max_steps_per_phase)
+            # ── 手动 step 循环：每步后检查 token 消耗 ──
+            for _step_idx in range(self.max_steps_per_phase):
+                await agent.step()
+                steps += 1
+
+                # 从 agent history 中累计 token
+                phase_prompt = 0
+                phase_completion = 0
+                if hasattr(agent, 'state') and agent.state:
+                    history_obj = agent.state.history
+                    if hasattr(history_obj, 'history'):
+                        for h in history_obj.history:
+                            meta = getattr(h, 'metadata', None)
+                            if meta:
+                                u = getattr(meta, 'usage', None)
+                                if u:
+                                    phase_prompt += getattr(u, 'prompt_tokens', 0)
+                                    phase_completion += getattr(u, 'completion_tokens', 0)
+
+                # 判断任务是否完成 (优先于 token 限制)
+                is_done_flag = False
+                if hasattr(agent, 'state') and agent.state:
+                    hist = agent.state.history
+                    if hasattr(hist, 'is_done'):
+                        is_done_flag = hist.is_done()
+                    if hasattr(hist, 'is_goal_achieved'):
+                        is_done_flag = is_done_flag or hist.is_goal_achieved()
+
+                if is_done_flag:
+                    self._log(f"{phase_label} task done at step {steps}")
+                    break
+
+                # 动态 token 检查：当前累计 + 预估下步 (~900 tokens) > 预算 → 切阶段
+                total_tokens = phase_prompt + phase_completion
+                if total_tokens > 0 and total_tokens + 900 > self.max_tokens_per_phase:
+                    self._log(f"{phase_label} token budget: {total_tokens:,}/{self.max_tokens_per_phase:,} "
+                              f"({total_tokens*100//self.max_tokens_per_phase}%) — stopping")
+                    stopped_by_token_limit = True
+                    break
+
             elapsed = time.time() - start_ts
+
+            # 获取最终 history (手动循环后 agent.state.history 即最终 state)
+            history = agent.state.history if hasattr(agent, 'state') and agent.state else None
 
             # 提取结果
             is_done = False
-            if hasattr(history, "is_done"):
+            if history and hasattr(history, 'is_done'):
                 is_done = history.is_done()
-            if hasattr(history, "is_goal_achieved"):
+            if history and hasattr(history, 'is_goal_achieved'):
                 is_done = history.is_goal_achieved()
 
             final = ""
-            if hasattr(history, "final_result"):
+            if history and hasattr(history, 'final_result'):
                 final = str(history.final_result() or "")
 
-            # 步数
-            steps = len(history) if hasattr(history, "__len__") else 0
             self._total_steps += steps
             self._total_elapsed += elapsed
 
-            # Token
-            phase_prompt = 0
-            phase_completion = 0
-            if hasattr(history, "usage") and history.usage:
-                u = history.usage
-                phase_prompt = u.total_prompt_tokens
-                phase_completion = u.total_completion_tokens
-            # Fallback: 从每个 step 的 metadata 收集
-            if phase_prompt == 0 and hasattr(history, "history"):
-                for h in history.history:
-                    if hasattr(h, "metadata") and h.metadata and hasattr(h.metadata, "usage"):
-                        u = h.metadata.usage
-                        phase_prompt += getattr(u, "prompt_tokens", 0)
-                        phase_completion += getattr(u, "completion_tokens", 0)
+            # Fallback: 如果 history 内没拿到 token，从 agent usage 属性取
+            if phase_prompt == 0:
+                if hasattr(history, 'usage') and history.usage:
+                    u = history.usage
+                    phase_prompt = u.total_prompt_tokens
+                    phase_completion = u.total_completion_tokens
 
             self._token_usage["prompt"] += phase_prompt
             self._token_usage["completion"] += phase_completion
             self._token_usage["total"] += phase_prompt + phase_completion
 
+            # 阶段摘要：记录 token 使用率
+            token_pct = ((phase_prompt + phase_completion) * 100 // self.max_tokens_per_phase
+                         if self.max_tokens_per_phase else 0)
             result = {
                 "phase": phase_idx,
                 "success": is_done,
@@ -234,14 +285,17 @@ class AutoPhaseRunner:
                 "prompt_tokens": phase_prompt,
                 "completion_tokens": phase_completion,
                 "total_tokens": phase_prompt + phase_completion,
+                "token_budget_pct": token_pct,
+                "stopped_by_token": stopped_by_token_limit,
                 "final": final,
                 "history": history,
             }
             self._all_results.append(result)
 
-            self._log(f"{phase_label} done: {'✅' if is_done else '🔄'} "
+            status_icon = '✅' if is_done else ('🔄' if stopped_by_token_limit else '🔁')
+            self._log(f"{phase_label} done: {status_icon} "
                       f"{steps} steps, {elapsed:.0f}s, "
-                      f"{phase_prompt + phase_completion:,} tokens")
+                      f"{phase_prompt + phase_completion:,} tokens ({token_pct}% budget)")
 
             return result
 
@@ -254,7 +308,7 @@ class AutoPhaseRunner:
             result = {
                 "phase": phase_idx,
                 "success": False,
-                "steps": 0,
+                "steps": steps,
                 "elapsed": elapsed,
                 "error": str(e),
             }
@@ -281,6 +335,7 @@ class AutoPhaseRunner:
 
         self._log(f"AutoPhaseRunner: task={len(task)} chars, "
                   f"max_steps_per_phase={self.max_steps_per_phase}, "
+                  f"max_tokens_per_phase={self.max_tokens_per_phase:,}, "
                   f"max_phases={self.max_phases}")
 
         # 创建共享 BrowserSession
