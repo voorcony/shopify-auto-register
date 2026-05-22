@@ -18,9 +18,6 @@ import sys
 import traceback
 from typing import Optional
 
-sys.path.insert(0, "/home/agentuser/wa-automation")
-sys.path.insert(0, "/home/agentuser/browser_automation_bridge")
-
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.browser.session import BrowserSession as Browser
 from browser_use import Agent

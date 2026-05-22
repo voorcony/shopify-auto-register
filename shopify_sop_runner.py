@@ -29,8 +29,6 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _HOME = Path.home()  # /home/ubuntu
 EXPERIENCE_FILE = str(_HOME / "shopify_experience.json")
-WA_DIR = str(_HOME / "wa-automation")
-BRIDGE_DIR = str(_HOME / "browser_automation_bridge")
 
 # ─── 非敏感常量 ──────────────────────────────────
 FEISHU_SHEET_REGIS = "T8Za6f"   # 注册资料 sheetId
@@ -606,9 +604,6 @@ async def run_agent(cdp_url: str, phases: list[dict]):
     使用 lib/auto_phase_runner.AutoPhaseRunner 自动在 ~18 步切阶段。
     保留原始参数签名以实现向后兼容。
     """
-    sys.path.insert(0, WA_DIR)
-    sys.path.insert(0, BRIDGE_DIR)
-
     from lib.auto_phase_runner import AutoPhaseRunner
 
     # 将多个 phase 的 task 合并为一个完整任务
