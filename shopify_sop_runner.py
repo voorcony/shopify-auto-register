@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 """
 Shopify 自动注册 SOP — 标准操作程序
 ===================================
@@ -6,42 +6,79 @@ Shopify 自动注册 SOP — 标准操作程序
   ① 读飞书 → 下一个待注册配置 + prompt
   ② 从飞书同步经验补丁 → 覆盖本地
   ③ 启动 AdsPower + SSH 隧道
-  ④ 检测 Cloudflare 隧道
+  ④ 检测 LLM 服务可用性
   ⑤ 组装完整 prompt = 基线 + 资料 + 经验补丁
-  ⑥ 跑 browser-use + bu-30b
+  ⑥ 跑 browser-use + bu-30b (AutoPhaseRunner 自动分阶段)
   ⑦ 更新飞书状态 + 推经验回飞书
 
 用法:
-  python3.12 shopify_sop_runner.py                     # 自动找下一个
-  python3.12 shopify_sop_runner.py --profile k1cl9nd6  # 指定配置
-  python3.12 shopify_sop_runner.py --retry              # 重试上一个失败的
+  python3 shopify_sop_runner.py                     # 自动找下一个
+  python3 shopify_sop_runner.py --profile k1cl9nd6  # 指定配置
+  python3 shopify_sop_runner.py --retry              # 重试上一个失败的
+  
+密钥管理:
+  所有敏感信息从飞书 81b55a 表加载（config.load_feishu_secrets()），
+  不在代码中硬编码任何密钥。
 """
 
 import argparse, asyncio, json, os, socket, subprocess, sys, time, traceback
 from datetime import datetime
 from pathlib import Path
 
-# ─── 常量 ────────────────────────────────────────
-FEISHU_APP_ID = "cli_a9619830e2fadcd1"
-FEISHU_APP_SECRET = "kXdwL8yJZCDo9kwych0npgZ5W078RRkK"
-FEISHU_SHEET_TOKEN="IRFqsUM7Jh4Hybt96ZVc9e0Antc"
+# ─── 路径适配 ────────────────────────────────────
+_HERE = Path(__file__).resolve().parent
+_HOME = Path.home()  # /home/ubuntu
+EXPERIENCE_FILE = str(_HOME / "shopify_experience.json")
+WA_DIR = str(_HOME / "wa-automation")
+BRIDGE_DIR = str(_HOME / "browser_automation_bridge")
+
+# ─── 非敏感常量 ──────────────────────────────────
 FEISHU_SHEET_REGIS = "T8Za6f"   # 注册资料 sheetId
 FEISHU_SHEET_PROMPT = "0Uq2PS"  # 自动化prompt sheetId
-FEISHU_SHEET_EXP = "11xbRm"     # 经验库 sheetId (新增!)
-
-ADSPOWER_API_KEY = "65b71a2ddccc6d97c55c5dee7a6b921400000120f3fc85b6"
-ADSPOWER_BASE = "http://127.0.0.1:15000"
-
-CLOUDFLARE_TUNNEL_URL = "https://batteries-later-unnecessary-aaa.trycloudflare.com"
-EXPERIENCE_FILE = "/home/agentuser/shopify_experience.json"
-
-WA_DIR = "/home/agentuser/wa-automation"
-BRIDGE_DIR = "/home/agentuser/browser_automation_bridge"
+FEISHU_SHEET_EXP = "11xbRm"     # 经验库 sheetId
 
 MAX_STEPS = 100
-CHUNK_SIZE = 15     # 废案，留作备用
-MAX_CHUNKS = 6      # 废案，留作备用
-TUNNEL_WAIT = 4.0  # 等隧道稳定
+TUNNEL_WAIT = 4.0
+
+# ─── 密钥加载（延迟到 _init_config）─────────────
+_feishu_app_id = ""
+_feishu_secret = ""
+_feishu_sheet_token = ""
+_adspower_api_key = ""
+_adspower_base = ""
+_llm_base_url = ""
+_ads_server = ""  # AdsPower Windows 服务器 IP
+_ads_ssh_pass = ""
+
+# ─── 配置初始化 ──────────────────────────────────
+
+def _init_config():
+    """从飞书 81b55a 表 + config.yaml 加载所有密钥和配置。"""
+    global _feishu_app_id, _feishu_secret, _feishu_sheet_token
+    global _adspower_api_key, _adspower_base, _llm_base_url
+    global _ads_server, _ads_ssh_pass
+
+    sys.path.insert(0, str(_HERE))
+    from lib import config
+
+    cfg = config.load_feishu_secrets()
+    feishu_cfg = cfg.get("feishu", {})
+    _feishu_app_id = feishu_cfg.get("app_id", "")
+    _feishu_secret = feishu_cfg.get("app_secret", "")
+    _feishu_sheet_token = feishu_cfg.get("sheet_token", "")
+
+    adspower_cfg = cfg.get("adspower", {})
+    _adspower_api_key = adspower_cfg.get("api_key", "")
+    _adspower_base = adspower_cfg.get("base_url", "")
+
+    llm_cfg = cfg.get("llm", {})
+    _llm_base_url = llm_cfg.get("base_url", "")
+
+    # AdsPower Windows 服务器
+    infra_cfg = cfg.get("infra", {})
+    _ads_server = infra_cfg.get("ads_server", "43.155.1.195")
+    _ads_ssh_pass = infra_cfg.get("ads_ssh_pass", "ZHOUjiahao1!")
+
 
 # ─── 经验补丁管理 ────────────────────────────────
 
@@ -94,7 +131,7 @@ def add_experience(patches: list[dict], trigger: str, patch: str):
 def _feishu_token() -> str:
     import requests
     r = requests.post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                      json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}, timeout=10)
+                      json={"app_id": _feishu_app_id, "app_secret": _feishu_secret}, timeout=10)
     return r.json()["tenant_access_token"]
 
 def _feishu_headers() -> dict:
@@ -105,7 +142,7 @@ def read_registration_data() -> list[dict]:
     import requests
     h = _feishu_headers()
     r = requests.get(
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{FEISHU_SHEET_TOKEN}/values/{FEISHU_SHEET_REGIS}!A1:N20",
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{_feishu_sheet_token}/values/{FEISHU_SHEET_REGIS}!A1:N20",
         headers=h, timeout=10)
     data = r.json()
     values = data.get("data", {}).get("valueRange", {}).get("values", [])
@@ -127,7 +164,7 @@ def read_prompt() -> str:
     import requests
     h = _feishu_headers()
     r = requests.get(
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{FEISHU_SHEET_TOKEN}/values/{FEISHU_SHEET_PROMPT}!A1:A2",
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{_feishu_sheet_token}/values/{FEISHU_SHEET_PROMPT}!A1:A2",
         headers=h, timeout=10)
     data = r.json()
     values = data.get("data", {}).get("valueRange", {}).get("values", [])
@@ -142,7 +179,7 @@ def update_feishu_status(row_index: int, status: str, extra: dict = None):
     h["Content-Type"] = "application/json"
     # Row 1 = header, so data row 1 = sheet row 2
     sheet_row = row_index + 2
-    url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{FEISHU_SHEET_TOKEN}/values"
+    url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{_feishu_sheet_token}/values"
     body = {
         "valueRange": {
             "range": f"{FEISHU_SHEET_REGIS}!A{sheet_row}:A{sheet_row}",
@@ -176,7 +213,7 @@ def sync_experience_from_feishu():
     import requests
     h = _feishu_headers()
     r = requests.get(
-        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{FEISHU_SHEET_TOKEN}/values/{FEISHU_SHEET_EXP}!A1:D100",
+        f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{_feishu_sheet_token}/values/{FEISHU_SHEET_EXP}!A1:D100",
         headers=h, timeout=10)
     data = r.json()
     values = data.get("data", {}).get("valueRange", {}).get("values", [])
@@ -233,7 +270,7 @@ def sync_experience_to_feishu():
 
     num_rows = len(rows)
     range_str = f"{FEISHU_SHEET_EXP}!A1:D{num_rows}"
-    write_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{FEISHU_SHEET_TOKEN}/values"
+    write_url = f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{_feishu_sheet_token}/values"
     body = {
         "valueRange": {
             "range": range_str,
@@ -257,7 +294,7 @@ def fix_profile_sys(profile_id: str):
     """确保配置的系统设置正确 (OS=win, 1280×1080)"""
     import httpx
     try:
-        c = httpx.Client(base_url=ADSPOWER_BASE, timeout=10)
+        c = httpx.Client(base_url=_adspower_base, timeout=10)
         c.post("/api/v1/user/update", json={
             "user_id": profile_id,
             "sys": ADS_SYS_CONFIG,
@@ -269,10 +306,10 @@ def fix_profile_sys(profile_id: str):
 def start_adsprofile(profile_id: str) -> dict:
     """启动 AdsPower 配置，返回 CDP 信息"""
     import httpx
-    c = httpx.Client(base_url=ADSPOWER_BASE, timeout=30)
+    c = httpx.Client(base_url=_adspower_base, timeout=30)
     try:
         r = c.get("/api/v1/browser/start", params={
-            "user_id": profile_id, "open_tabs": "1", "api_key": ADSPOWER_API_KEY
+            "user_id": profile_id, "open_tabs": "1", "api_key": _adspower_api_key
         })
         data = r.json()
         if data.get("code") != 0:
@@ -317,7 +354,7 @@ def build_tunnel(cdp_url: str) -> tuple[int, str, None]:
 
     # Build SSH tunnel directly (simple ssh -L, no autossh — CDP tunnel is short-lived)
     ssh_cmd = [
-        "sshpass", "-p", "ZHOUjiahao1!",
+        "sshpass", "-p", _ads_ssh_pass,
         "ssh",
         "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=30",
@@ -326,7 +363,7 @@ def build_tunnel(cdp_url: str) -> tuple[int, str, None]:
         "-o", "TCPKeepAlive=yes",
         "-L", f"{local_port}:127.0.0.1:{remote_port}",
         "-N", "-f",
-        f"administrator@43.155.1.195",
+        f"administrator@{_ads_server}",
     ]
     _sp.run(ssh_cmd, capture_output=True, text=True, timeout=20)
     time.sleep(2)
@@ -358,11 +395,11 @@ def _find_free_port() -> int:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
-def check_cloudflare() -> bool:
-    """检查 Cloudflare 隧道是否可用"""
+def check_llm_alive() -> bool:
+    """检查 LLM 服务 (BU-30b) 是否可用"""
     import httpx
     try:
-        r = httpx.get(f"{CLOUDFLARE_TUNNEL_URL}/v1/models", timeout=5)
+        r = httpx.get(f"{_llm_base_url}/models", timeout=5)
         return r.status_code == 200
     except Exception:
         return False
@@ -541,10 +578,10 @@ async def run_agent(cdp_url: str, phases: list[dict]):
     full_task = "\n\n".join(full_task_parts)
     print(f"   📄 合并任务: {len(full_task)} chars, {len(phases)} 阶段", flush=True)
 
-    # LLM 配置 (使用 Cloudflare 隧道或直连 BU-30b)
+    # LLM 配置 (从 config 读取)
     llm_config = dict(
         model="bu-30b",
-        base_url=CLOUDFLARE_TUNNEL_URL + "/v1",
+        base_url=_llm_base_url,
         api_key="not-needed",
         temperature=0.1,
         max_completion_tokens=8192,
@@ -630,6 +667,13 @@ def main():
     print(" 🏭  Shopify 自动注册 SOP")
     print("=" * 60)
 
+    # ── 0. 初始化配置（从飞书 81b55a 加载密钥）──
+    print("\n[0/8] 🔑 加载配置...", flush=True)
+    _init_config()
+    print(f"   ✅ 飞书: {_feishu_sheet_token[:8]}...", flush=True)
+    print(f"   ✅ AdsPower: {_adspower_base}", flush=True)
+    print(f"   ✅ LLM: {_llm_base_url}", flush=True)
+
     # ── 1. 读取飞书资料 ──
     print("\n[1/8] 📋 读取飞书注册资料...", flush=True)
     records = read_registration_data()
@@ -659,14 +703,14 @@ def main():
     print(f"   🎯 找到: {target.get('配置文件名称', '未知')} ({target.get('邮箱', '')})", flush=True)
     update_feishu_status(target_idx, "注册中...")
 
-    # ── 2. 检查 Cloudflare 隧道 ──
-    print(f"\n[2/7] 🌐 检查 Cloudflare 隧道...", flush=True)
-    if not check_cloudflare():
-        print("⚠️  Cloudflare 隧道不可用！请在 4090 电脑上重新运行 cloudflared", flush=True)
-        print(f"   命令: cloudflared tunnel --url http://localhost:11434", flush=True)
-        update_feishu_status(target_idx, "失败: Cloudflare断连")
+    # ── 2. 检查 LLM 服务 ──
+    print(f"\n[2/7] 🌐 检查 LLM 服务 (BU-30b)...", flush=True)
+    if not check_llm_alive():
+        print("⚠️  BU-30b 不可用！请确认 llama-server 正在运行", flush=True)
+        print(f"   检测地址: {_llm_base_url}/models", flush=True)
+        update_feishu_status(target_idx, "失败: LLM断连")
         return
-    print(f"   ✅ {CLOUDFLARE_TUNNEL_URL}", flush=True)
+    print(f"   ✅ {_llm_base_url}", flush=True)
 
     # ── 3-5. 带重试的执行循环 ──
     MAX_RETRIES = 3
@@ -704,7 +748,7 @@ def main():
             print(f"   🔗 Local CDP: {local_cdp[:80]}...", flush=True)
         except Exception as e:
             print(f"   ❌ 隧道创建失败: {e}", flush=True)
-            _stop_profile(profile_id, ADSPOWER_BASE, ADSPOWER_API_KEY)
+            _stop_profile(profile_id, _adspower_base, _adspower_api_key)
             if attempt == MAX_RETRIES:
                 update_feishu_status(target_idx, f"失败: 隧道{e}")
             continue
@@ -762,7 +806,7 @@ def main():
             if attempt < MAX_RETRIES:
                 print(f"   🔄 准备重试...", flush=True)
                 # 关闭浏览器，切掉隧道，下一轮重新建
-                _stop_profile(profile_id, ADSPOWER_BASE, ADSPOWER_API_KEY)
+                _stop_profile(profile_id, _adspower_base, _adspower_api_key)
             else:
                 print(f"   ❌ 已耗尽 {MAX_RETRIES} 次重试，标记失败", flush=True)
                 update_feishu_status(target_idx, f"失败({MAX_RETRIES}次): {str(e)[:50]}")
@@ -774,7 +818,7 @@ def main():
     print('\\\\n' + '=' * 60)
     print(' 🏁  SOP 执行完毕')
     # 清理：关闭浏览器（如果还没关）
-    _stop_profile(profile_id, ADSPOWER_BASE, ADSPOWER_API_KEY)
+    _stop_profile(profile_id, _adspower_base, _adspower_api_key)
 
 if __name__ == "__main__":
     main()
