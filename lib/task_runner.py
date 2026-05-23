@@ -16,12 +16,14 @@
       _init_config, read_registration_data, read_prompt, update_feishu_status,
       sync_experience_from_feishu, sync_experience_to_feishu,
       start_adsprofile, _stop_profile, build_tunnel, check_llm_alive,
-      _startup_parallel, run_agent, run_with_retry,
+      _startup_parallel, run_agent, run_with_retry, run_task,
   )
 """
 
 import asyncio, json, socket, sys, time, traceback
 from pathlib import Path
+
+from lib.exceptions import UserAbortException
 
 # ─── 路径适配 ────────────────────────────────────
 _HERE = Path(__file__).resolve().parent.parent  # /home/ubuntu (repo root)
@@ -399,7 +401,7 @@ async def _startup_parallel(profile_id: str):
 
 # ─── Agent 执行 ─────────────────────────────────────
 
-async def run_agent(cdp_url: str, phases: list[dict]):
+async def run_agent(cdp_url: str, phases: list[dict], task_id: str = ""):
     """按任务阶段运行 browser-use — 自动分阶段避免 16K 上下文溢出。
 
     使用 lib/auto_phase_runner.AutoPhaseRunner 自动在 ~18 步切阶段。
@@ -418,13 +420,15 @@ async def run_agent(cdp_url: str, phases: list[dict]):
     full_task = "\n\n".join(full_task_parts)
     print(f"   📄 合并任务: {len(full_task)} chars, {len(phases)} 阶段", flush=True)
 
-    # LLM 配置 (从 config 读取)
+    # LLM 配置 (从 config 读取) — 模型名必须匹配 llama-server 实际模型
     llm_config = dict(
-        model="bu-30b",
+        model="browser-use/bu-30b-a3b-preview-Q4_K_M.gguf",  # / 触发生成 1KB 精简 prompt
         base_url=_llm_base_url,
         api_key="not-needed",
         temperature=0.1,
         max_completion_tokens=8192,
+        # add_schema_to_system_prompt / dont_force_structured_output 已不需要
+        # browser-use/ 前缀自动加载 270 token 原生 prompt
     )
 
     runner = AutoPhaseRunner(
@@ -434,6 +438,7 @@ async def run_agent(cdp_url: str, phases: list[dict]):
         max_steps_per_phase=18,
         max_phases=max(len(phases) * 2, 6),  # 每个阶段最多拆 2 次
         verbose=True,
+        task_id=task_id,
     )
 
     result = await runner.run(full_task)
@@ -511,28 +516,28 @@ def run_with_retry(profile_id: str, phases: list[dict], max_retries: int = 3):
     Returns:
         (success: bool, history, final: str, error: Exception|None)
     """
+    from pathlib import Path
+    STATUS_FILE = Path("/tmp/.run_task_status")
+
+    def _status(msg: str):
+        STATUS_FILE.write_text(msg)
+        print(msg, flush=True)
+
     last_error = None
 
     for attempt in range(1, max_retries + 1):
         if attempt > 1:
-            print(f"\n{'='*50}", flush=True)
-            print(f" 🔄 第 {attempt}/{max_retries} 次重试", flush=True)
-            print(f"{'='*50}", flush=True)
+            _status(f"🔄 第 {attempt}/{max_retries} 次重试...")
 
         # ── 并行启动: LLM 检查 + AdsPower + SSH 隧道 ⚡ ──
-        print(f"\n⚡ 并行启动 (LLM 检查 + AdsPower + 隧道)...", flush=True)
+        _status(f"🔍 检查 LLM + 启动 AdsPower + 隧道... (第{attempt}次)")
         try:
             llm_ok, cdp_info, local_port, local_cdp, tunnel_proc = (
                 asyncio.run(_startup_parallel(profile_id))
             )
-            print(f"   ✅ LLM: {_llm_base_url}", flush=True)
-            print(f"   ✅ Profile: {profile_id}", flush=True)
-            print(f"   🔗 CDP: {cdp_info['cdp_url'][:60]}...", flush=True)
-            print(f"   ✅ Tunnel: 127.0.0.1:{local_port} → Windows:{cdp_info['debug_port']}", flush=True)
-            print(f"   🔗 Local CDP: {local_cdp[:80]}...", flush=True)
+            _status(f"✅ LLM 可达 | AdsPower 已启动 | 隧道: {local_port}")
         except Exception as e:
-            print(f"   ❌ 启动失败: {e}", flush=True)
-            # 尝试清理 AdsPower（可能已部分启动）
+            _status(f"❌ 启动失败: {e}")
             try:
                 _stop_profile(profile_id, _adspower_base, _adspower_api_key)
             except Exception:
@@ -541,24 +546,103 @@ def run_with_retry(profile_id: str, phases: list[dict], max_retries: int = 3):
             continue
 
         # ── 组装 prompt + 跑 agent ──
-        print(f"\n🧩 组装阶段任务 + 启动 Agent...", flush=True)
-        print(f"   📄 {len(phases)} 个阶段: {[p['name'] for p in phases]}", flush=True)
-        print(f"   🤖 bu-30b @ local RTX 4090", flush=True)
+        phase_names = [p['name'] for p in phases]
+        _status(f"🤖 Agent 执行中 ({len(phases)} 阶段: {phase_names})...")
 
         try:
-            history, final = asyncio.run(run_agent(local_cdp, phases))
+            history, final = asyncio.run(run_agent(local_cdp, phases, task_id=profile_id))
             result = final or "无结果"
-            print(f"\n   ✅ 全部阶段完成!", flush=True)
-            print(f"   📝 {result[:200]}", flush=True)
+            _status(f"✅ 全部阶段完成! {str(result)[:200]}")
             return (True, history, final, None)
+        except UserAbortException:
+            _status("🛑 用户中止任务")
+            return (False, None, "用户中止", None)
         except Exception as e:
             last_error = e
-            print(f"\n   ❌ Agent 执行出错 (第{attempt}次): {e}", flush=True)
+            _status(f"❌ Agent 执行出错 (第{attempt}次): {e}")
             traceback.print_exc()
 
             if attempt < max_retries:
-                print(f"   🔄 准备重试...", flush=True)
-                # 关闭浏览器，切掉隧道，下一轮重新建
+                _status(f"🔧 准备重试...")
                 _stop_profile(profile_id, _adspower_base, _adspower_api_key)
 
+    _status(f"❌ 重试耗尽: {last_error}")
     return (False, None, None, last_error)
+
+
+# ─── 通用任务入口（SaaS 核心 API）────────────────────────
+
+def run_task(task_description: str, profile_id: str,
+             sheet_id: str = "T8Za6f") -> tuple:
+    """通用任务入口：自然语言 → DeepSeek 拆解 → 飞书数据注入 → 执行。
+
+    SaaS 架构的核心函数。用户只需一句话，系统全自动处理：
+    ① DeepSeek 将 NL 拆解为结构化 phases
+    ② PlaceholderResolver 从飞书注入真实注册数据
+    ③ run_with_retry 接管 AdsPower 启动/隧道/Agent 执行/重试
+
+    进度通过 /tmp/.run_task_status 文件对外输出，解决管道缓冲问题。
+
+    Args:
+        task_description: 自然语言任务描述，如 "帮我在 GOAT 注册买家号"
+        profile_id: AdsPower profile ID，如 "k1csb91c"
+        sheet_id: 飞书注册资料 sheetId（默认 T8Za6f）
+
+    Returns:
+        (success, history, final, error) — 同 run_with_retry
+    """
+    from lib.prompt_builder import build_phases
+    from lib.placeholder_resolver import resolve_phases
+    from pathlib import Path
+
+    STATUS_FILE = Path("/tmp/.run_task_status")
+
+    def _status(msg: str):
+        """写状态到文件和 stdout"""
+        STATUS_FILE.write_text(msg)
+        print(msg, flush=True)
+
+    # ── 1. 初始化配置 ──
+    _status("🔑 加载配置...")
+    _init_config()
+    _status(f"✅ 配置加载完成 | profile={profile_id} | 任务={task_description[:40]}...")
+
+    # ── 2. 读取飞书注册资料 ──
+    _status("📋 读取飞书注册资料...")
+    try:
+        records = read_registration_data(sheet_id)
+        profile_data = {}
+        for rec in records:
+            name = rec.get("配置文件名称", "")
+            if profile_id in name:
+                profile_data = rec
+                break
+        if profile_data:
+            email = profile_data.get("邮箱", "N/A")
+            _status(f"✅ 找到资料: {email}")
+        else:
+            _status(f"⚠️ 未找到 profile {profile_id} 的资料，使用默认值")
+    except Exception as e:
+        _status(f"⚠️ 读取飞书失败 ({e})，使用默认值")
+        profile_data = {}
+
+    # ── 3. DeepSeek 拆解 + 飞书数据注入 ──
+    _status("🤖 DeepSeek 正在拆解任务...")
+    try:
+        phases = build_phases(task_description)
+        phase_names = [p['name'] for p in phases]
+        _status(f"✅ DeepSeek 生成 {len(phases)} 个阶段: {phase_names}")
+    except Exception as e:
+        _status(f"❌ DeepSeek 拆解失败: {e}")
+        return (False, None, None, e)
+
+    _status("🔗 注入飞书注册数据...")
+    try:
+        phases = resolve_phases(phases, profile_data)
+        _status(f"✅ 占位符已替换")
+    except Exception as e:
+        _status(f"⚠️ 占位符注入失败 ({e})，使用原始 phases")
+
+    # ── 4. 执行 ──
+    _status("⚡ 启动 AdsPower + SSH 隧道...")
+    return run_with_retry(profile_id, phases)
