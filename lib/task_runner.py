@@ -610,15 +610,11 @@ def run_task(task_description: str, profile_id: str,
     # ── 2. 读取飞书注册资料 ──
     _status("📋 读取飞书注册资料...")
     try:
-        records = read_registration_data(sheet_id)
-        profile_data = {}
-        for rec in records:
-            name = rec.get("配置文件名称", "")
-            if profile_id in name:
-                profile_data = rec
-                break
+        from lib.registration_manager import RegistrationManager
+        rm = RegistrationManager()
+        profile_data = rm.get_registration(profile_id) or {}
         if profile_data:
-            email = profile_data.get("邮箱", "N/A")
+            email = profile_data.get("email", "N/A")
             _status(f"✅ 找到资料: {email}")
         else:
             _status(f"⚠️ 未找到 profile {profile_id} 的资料，使用默认值")

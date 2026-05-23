@@ -29,21 +29,31 @@ from typing import Any
 # ── 飞书列名 → Python 参数名映射 ──────────────────────────
 # 飞书表 T8Za6f 的列名映射到内部使用的 key
 FEISHU_FIELD_MAP: dict[str, str] = {
+    # 飞书中文列名 → RegistrationManager 标准化字段名
     "邮箱": "email",
-    "shopify密码": "password",
-    "First_Name": "first",
-    "Last_Name": "last",
+    "邮箱密码": "email_password",
+    "shopify密码": "shopify_password",
+    "First_Name": "first_name",
+    "Last_Name": "last_name",
     "TEL": "phone",
+    "地址": "address",
+    "城市": "city",
+    "州": "state",
+    "邮编": "zip",
+    "SSN": "ssn",
+    "店铺名": "shop_name",
+    "店铺域名": "store_domain",
 }
 
 # ── 默认值（飞书数据缺失时使用）────────────────────────
 FALLBACK_VALUES: dict[str, str] = {
     "email": "unknown@example.com",
-    "password": "DefaultP@ss2024",
-    "first": "User",
-    "last": "Test",
+    "email_password": "",
+    "shopify_password": "DefaultP@ss2024",
+    "first_name": "User",
+    "last_name": "Test",
     "phone": "0000000000",
-    "store": "MyStore",
+    "shop_name": "MyStore",
 }
 
 # ── 占位符正则 ─────────────────────────────────────────
@@ -294,9 +304,15 @@ def _static_fields() -> list[dict]:
     """静态字段列表（回退方案）。"""
     return [
         {"name": "邮箱", "placeholder": "{feishu:邮箱}", "sample": "user@example.com"},
+        {"name": "邮箱密码", "placeholder": "{feishu:邮箱密码}", "sample": "********"},
         {"name": "shopify密码", "placeholder": "{feishu:shopify密码}", "sample": "********"},
         {"name": "First_Name", "placeholder": "{feishu:First_Name}", "sample": "John"},
         {"name": "Last_Name", "placeholder": "{feishu:Last_Name}", "sample": "Doe"},
         {"name": "TEL", "placeholder": "{feishu:TEL}", "sample": "7817455182"},
+        {"name": "地址", "placeholder": "{feishu:地址}", "sample": "123 Main St"},
+        {"name": "城市", "placeholder": "{feishu:城市}", "sample": "New York"},
+        {"name": "州", "placeholder": "{feishu:州}", "sample": "NY"},
+        {"name": "邮编", "placeholder": "{feishu:邮编}", "sample": "10001"},
+        {"name": "SSN", "placeholder": "{feishu:SSN}", "sample": "***-**-****"},
         {"name": "store_name", "placeholder": "{feishu:store_name}", "sample": "John Fashion"},
     ]
