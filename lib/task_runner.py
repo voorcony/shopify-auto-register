@@ -642,3 +642,98 @@ def run_task(task_description: str, profile_id: str,
     # ── 4. 执行 ──
     _status("⚡ 启动 AdsPower + SSH 隧道...")
     return run_with_retry(profile_id, phases)
+
+
+# ─── 通用任务入口 v2（对话引擎驱动）────────────────────────
+
+def run_task_v2(user_id: str, message: str, data_service=None,
+                adspower_profiles: list[str] | None = None) -> dict:
+    """对话驱动的任务入口（方案 C）。
+
+    与 run_task 的区别：
+      - 输入是「user_id + 自然语言消息」，而非「task_description + profile_id」
+      - 由 ConversationEngine 负责意图分析、信息抽取、缺失追问
+      - 数据来源是 SQLite（DataService），不再依赖飞书表
+
+    生命周期：
+      ① ConversationEngine.process 返回 ConversationResponse
+      ② 若 action == "ask" / "confirm" / "chat"：仅返回响应，不执行
+      ③ 若 action == "execute"：用响应里的 phases + profile_id 调 run_with_retry
+
+    Args:
+        user_id:           用户标识（首版固定 "default_user"）
+        message:           用户原始消息
+        data_service:      AbstractDataService 实例；None 则用 SQLiteDataService 默认实例
+        adspower_profiles: 可选的 profile 列表，注入到对话引擎做意图分析
+
+    Returns:
+        dict: {
+            "action": "ask|confirm|execute|chat",
+            "reply":  str,
+            "task_id": str|None,
+            "profile_id": str|None,
+            "phases": list,
+            "missing_fields": list,
+            "execution": None | (success, history, final, error)   # 仅 execute 时有值
+        }
+    """
+    import asyncio as _aio
+    from lib.data_service import SQLiteDataService, get_default_data_service
+    from lib.conversation_engine import ConversationEngine
+
+    # ── 0. 初始化配置（执行链路需要，先加载好）──
+    _init_config()
+
+    # ── 1. 准备 DataService + 对话引擎 ──
+    if data_service is None:
+        data_service = get_default_data_service()
+    engine = ConversationEngine(data_service, adspower_profiles=adspower_profiles)
+
+    # ── 2. 跑对话 ──
+    resp = _aio.run(engine.process(user_id, message))
+
+    result = {
+        "action":         resp.action,
+        "reply":          resp.reply,
+        "task_id":        resp.task_id,
+        "profile_id":     resp.profile_id,
+        "phases":         resp.phases,
+        "missing_fields": resp.missing_fields,
+        "execution":      None,
+    }
+
+    # ── 3. 用户已确认 → 调旧的 run_with_retry ──
+    if resp.action == "execute" and resp.phases and resp.profile_id:
+        print(f"   ▶️  执行任务 {resp.task_id}: {len(resp.phases)} 阶段 @ {resp.profile_id}",
+              flush=True)
+        try:
+            success, history, final, error = run_with_retry(resp.profile_id, resp.phases)
+        except Exception as e:
+            success, history, final, error = (False, None, None, e)
+
+        # 回写任务状态
+        token_usage = None
+        try:
+            if history is not None and hasattr(history, "usage"):
+                u = history.usage
+                token_usage = {
+                    "prompt":     getattr(u, "total_prompt_tokens", 0),
+                    "completion": getattr(u, "total_completion_tokens", 0),
+                    "total":      getattr(u, "total_tokens", 0),
+                }
+        except Exception:
+            token_usage = None
+
+        try:
+            data_service.update_task_status(
+                resp.task_id,
+                status="done" if success else "failed",
+                result=str(final) if final else (str(error) if error else None),
+                token_usage=token_usage,
+            )
+        except Exception as e:
+            print(f"   ⚠️  任务状态回写失败: {e}", flush=True)
+
+        result["execution"] = (success, history, final, error)
+
+    return result
