@@ -44,6 +44,34 @@ from lib.task_runner import (
     run_with_retry,
 )
 
+# ─── AI 驱动的 phases 生成（新方式）─────────────────
+
+def build_phases_with_deepseek(description: str, profile_data: dict) -> list[dict]:
+    """用 DeepSeek 动态生成 phases，然后通过 PlaceholderResolver 注入飞书数据。
+
+    这是新推荐的方式：让 AI 理解任务并生成 phases，
+    敏感数据通过 {feishu:列名} 占位符安全注入。
+
+    Args:
+        description: 自然语言任务描述（中文）
+        profile_data: 飞书注册表的一行数据
+
+    Returns:
+        [{"name": ..., "task": ..., "max_steps": N}, ...]
+    """
+    from lib.prompt_builder import build_phases as deepseek_build
+    from lib.placeholder_resolver import resolve_phases
+
+    # 1. DeepSeek 生成带占位符的 phases
+    print("   🤖 DeepSeek 正在拆解任务...", flush=True)
+    phases = deepseek_build(description)
+
+    # 2. 注入飞书真实数据
+    print("   🔗 注入飞书注册数据...", flush=True)
+    phases = resolve_phases(phases, profile_data)
+
+    return phases
+
 # ─── 经验补丁管理 ────────────────────────────────
 
 def load_experience() -> list[dict]:

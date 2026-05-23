@@ -33,26 +33,118 @@ _PHASES_DIR = _HOME / ".shopify" / "phases" / "generated"
 _CACHE_INDEX_FILE = _CACHE_DIR / "index.json"
 _CACHE_TTL_SECONDS = 7 * 24 * 3600  # 7 天
 
-# ── 敏感词扫描规则 ─────────────────────────────────────────
+# ── 三层安全扫描规则 ───────────────────────────────────────
+#
+# TIER 1 (🔴 BLOCK): 恶意意图 — 操作动词 + 目标对象 组合匹配
+# TIER 2 (🟡 WARN):  敏感数据硬编码 — 明文密码/API Key/卡号
+# TIER 3 (🟢 ALLOW): 正常业务操作 — 默认放行
+#
+# 设计原则：
+#   1. 先 T1 后 T2 — T1 命中立即拦截，不再查 T2
+#   2. 意图 > 关键词 — "填写密码框" 是 T3，"密码是Abc123" 是 T2，"破解密码" 是 T1
+#   3. 组合匹配 — T1 需要"动词+目标"同时出现，单独的"删除"或"密码"不触发
 
-# 🔴 高危：任一匹配 → 立即拒绝
-DANGEROUS_PATTERNS: list[tuple[str, str]] = [
-    (r"(信用卡|credit\s*card|CVV|cvv)", "支付信息"),
-    (r"(密码|password|passwd|secret|token|api\s*key)", "凭证操作"),
-    (r"(删除|清空|delete|drop\s+table|rm\s+-rf|format|wipe|shutdown)", "破坏性操作"),
-    (r"(转账|transfer|汇款|wire)", "资金操作"),
-    (r"(SQL\s*注入|XSS|反弹\s*shell|reverse\s*shell|后门|backdoor)", "攻击行为"),
-    (r"(窃取|盗号|hack|crack|破解)", "隐私侵犯"),
+from enum import Enum
+from dataclasses import dataclass, field
+
+class ScanLevel(Enum):
+    BLOCK = "block"   # 🔴 拦截
+    WARN = "warn"     # 🟡 警告
+    ALLOW = "allow"   # 🟢 放行
+
+@dataclass
+class ScanResult:
+    level: ScanLevel
+    reasons: list[str] = field(default_factory=list)
+    suggestions: list[str] = field(default_factory=list)
+    auto_fixed: str | None = None
+
+# ── TIER 1: 恶意意图规则 ─────────────────────────────────
+# 格式: {category, actions: [动词], targets: [目标]}
+# 必须 动词+目标 同时匹配才触发
+MALICIOUS_INTENT_RULES: list[dict] = [
+    {
+        "category": "data_theft",
+        "actions": [r"窃取", r"盗取", r"偷", r"导出.*外部", r"发送.*外部", r"上传.*外部",
+                     r"exfiltrate", r"steal", r"dump.*external",
+                     r"export.*external", r"send.*external", r"upload.*external"],
+        "targets": [r"数据", r"数据库", r"密码", r"cookie", r"session", r"token",
+                    r"data", r"password", r"credit.card", r"用户信息", r"客户.*信息",
+                    r"customer", r"email.*list"],
+    },
+    {
+        "category": "system_intrusion",
+        "actions": [r"注入", r"攻击", r"反弹", r"绕过.*认证", r"inject", r"attack",
+                     r"exploit", r"bypass.*auth", r"提权", r"越权"],
+        "targets": [r"SQL", r"XSS", r"shell", r"admin.*panel", r"登录.*系统",
+                    r"login.*system", r"webshell", r"数据库"],
+    },
+    {
+        "category": "credential_crack",
+        "actions": [r"破解", r"爆破", r"撞库", r"字典攻击", r"crack", r"brute.force",
+                     r"dictionary.attack", r"猜解"],
+        "targets": [r"密码", r"验证码", r"登录", r"password", r"login", r"credential",
+                    r"口令", r"pin"],
+    },
+    {
+        "category": "backdoor",
+        "actions": [r"植入", r"留.*后门", r"添加.*隐藏", r"implant", r"backdoor",
+                     r"隐藏.*管理", r"持久化"],
+        "targets": [r"后门", r"webshell", r"管理员.*权限", r"admin.*access",
+                    r"系统.*权限"],
+    },
+    {
+        "category": "mass_destruction",
+        "actions": [r"删除.*全部", r"删除.*所有", r"格式化", r"清空.*所有", r"清空.*全部",
+                     r"drop.*all", r"delete.*all", r"wipe.*all", r"全部.*删"],
+        "targets": [r"数据", r"数据库", r"服务器", r"data", r"database", r"server",
+                    r"files", r"商品", r"用户", r"订单", r"table"],
+    },
+    {
+        "category": "financial_fraud",
+        "actions": [r"转.*到.*自己", r"盗刷", r"虚假.*交易", r"套现", r"洗钱",
+                     r"transfer.*self", r"fraud"],
+        "targets": [r"钱", r"资金", r"信用卡", r"余额", r"money", r"balance"],
+    },
 ]
 
-# 🟡 警告：匹配但仅标记
-WARNING_PATTERNS: list[tuple[str, str]] = [
-    (r"(批量|bulk|所有|全部|all\b|every\b)", "批量操作"),
-    (r"(curl|wget|download)", "网络请求"),
-    (r"(关店|关闭\s*店铺|删除\s*店铺|close\s*store)", "不可逆店铺操作"),
+# ── TIER 2: 敏感数据硬编码检测 ────────────────────────────
+# 检测"数据值"而非"字段名"——"密码框"不触发，"密码是Abc123"触发
+_PASSWORD_VALUE_PATTERNS: list[str] = [
+    # 匹配 "密码是/为/=/: X" 以及 "密码设为/用/换成/设置成 X"
+    r'(密码|password|passwd|pwd)\s*(是|为|=|:|：|用|使用|设为|改成|设置为|设置成|换成)\s*(\S{3,})',
+]
+_API_KEY_PATTERNS: list[str] = [
+    r'(api[_\s]?key|apikey|secret|token)\s*(是|为|=|:|：)\s*([a-zA-Z0-9_\-]{12,})',
+    r'sk-[a-zA-Z0-9]{20,}',
+    r'Bearer\s+[a-zA-Z0-9_\-\.]{20,}',
 ]
 
 # ── System Prompt ───────────────────────────────────────────
+
+_PLACEHOLDER_INSTRUCTIONS = """
+IMPORTANT — DATA PLACEHOLDER RULES:
+
+When creating task phases that need user-specific data (email, password, name, phone, etc.),
+NEVER write the actual data values. Instead, use {feishu:列名} placeholders.
+
+Available feishu fields and their usage:
+  {feishu:邮箱}         — email address for account registration
+  {feishu:shopify密码}  — account password
+  {feishu:First_Name}   — user's first/given name
+  {feishu:Last_Name}    — user's last/family name
+  {feishu:TEL}          — phone number
+  {feishu:store_name}   — preferred store name (auto-generated)
+
+Correct usage (use placeholders for data):
+  "Enter email: {feishu:邮箱} and password: {feishu:shopify密码}"
+  "Fill the name fields with {feishu:First_Name} {feishu:Last_Name}"
+
+Wrong usage (DO NOT write actual data values):
+  "Enter email: john@example.com and password: Abc123"
+
+These placeholders will be automatically filled with real registration data from the Feishu system at runtime.
+"""
 
 SYSTEM_PROMPT = """You are a task decomposition expert. Your job is to break down a user's high-level task description into a sequence of actionable phases.
 
@@ -68,6 +160,7 @@ Each phase is a self-contained instruction for an AI browser agent that has a 14
 
 5. Number of phases: 3-6 for most tasks. Only use more if unavoidable.
 
+""" + _PLACEHOLDER_INSTRUCTIONS + """
 OUTPUT FORMAT (JSON only, no markdown):
 {
   "phases": [
@@ -92,12 +185,12 @@ Output:
   "phases": [
     {
       "name": "register-account",
-      "task": "Register a new Shopify account.\\n\\n1. Go to https://www.shopify.com\\n2. Click 'Start free trial'\\n3. Enter email: {email}, password: {password}\\n4. Fill name: {first} {last}\\n5. On plan selection, find and click 'Skip' or free trial — NEVER enter credit card info\\n6. Navigate to admin dashboard\\n\\nCRITICAL: If you reach admin dashboard, report SUCCESS immediately.",
+      "task": "Register a new Shopify account.\\n\\n1. Go to https://www.shopify.com\\n2. Click 'Start free trial'\\n3. Enter email: {feishu:邮箱}, password: {feishu:shopify密码}\\n4. Fill name: {feishu:First_Name} {feishu:Last_Name}\\n5. On plan selection, find and click 'Skip' or free trial — NEVER enter credit card info\\n6. Navigate to admin dashboard\\n\\nCRITICAL: If you reach admin dashboard, report SUCCESS immediately.",
       "max_steps": 30
     },
     {
       "name": "complete-setup",
-      "task": "Complete Shopify onboarding wizard.\\n\\n1. You should be at admin dashboard\\n2. If there's an onboarding checklist, complete it\\n3. Set country: United States, timezone: America/Chicago, currency: USD\\n4. Set store name: {store_name}\\n5. Skip any paid upgrades\\n\\nIf already past onboarding (main sidebar visible), report SUCCESS immediately.",
+      "task": "Complete Shopify onboarding wizard.\\n\\n1. You should be at admin dashboard\\n2. If there's an onboarding checklist, complete it\\n3. Set country: United States, timezone: America/Chicago, currency: USD\\n4. Set store name: {feishu:store_name}\\n5. Skip any paid upgrades\\n\\nIf already past onboarding (main sidebar visible), report SUCCESS immediately.",
       "max_steps": 20
     },
     {
@@ -195,18 +288,174 @@ def _cache_set(key: str, phases: list[dict], description: str) -> None:
         json.dump(phases, f, indent=2, ensure_ascii=False)
 
 
-# ── 安全扫描 ────────────────────────────────────────────────
+# ── 三层安全扫描 ────────────────────────────────────────────
+#
+# 顺序：先查恶意意图(TIER1)，再查敏感数据(TIER2)，最后放行(TIER3)
+# TIER1 命中立即返回 BLOCK，不再检查后续层级
 
+def _detect_malicious_intent(description: str) -> dict | None:
+    """恶意意图检测：操作动词 + 目标对象 组合匹配。
+
+    单纯的"密码"或"删除"不会触发，必须同时出现攻击性动词和敏感目标。
+    返回命中规则 dict，否则 None。
+    """
+    desc_lower = description.lower()
+
+    for rule in MALICIOUS_INTENT_RULES:
+        action_match = any(re.search(a, desc_lower, re.IGNORECASE) for a in rule["actions"])
+        if not action_match:
+            continue
+        target_match = any(re.search(t, desc_lower, re.IGNORECASE) for t in rule["targets"])
+        if target_match:
+            return {
+                "category": rule["category"],
+                "detail": "操作+目标的组合匹配了恶意意图规则",
+            }
+    return None
+
+
+def _is_placeholder_or_field_ref(text: str) -> bool:
+    """判断文本是否为占位符或字段引用（非数据值）。
+
+    "密码框" → True（字段引用）
+    "Abc123" → False（数据值）
+    """
+    if re.match(r'\{feishu:', text) or re.match(r'\{[a-z_]+\}', text):
+        return True
+    if re.search(r'(框|字段|field|box|input|输入)', text):
+        return True
+    return False
+
+
+def _luhn_check(card_number: str) -> bool:
+    """Luhn 算法校验信用卡号。"""
+    digits = [int(d) for d in card_number]
+    checksum = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        checksum += d
+    return checksum % 10 == 0
+
+
+def _detect_hardcoded_secrets(description: str) -> list[dict]:
+    """检测硬编码的敏感数据字面量。
+
+    关键区分：只检测"数据值"而非"字段名"。
+    "填写密码框" → 不触发（字段引用）
+    "密码是Abc123" → 触发（数据值）
+    """
+    secrets: list[dict] = []
+
+    # 1. 明文密码检测: "密码是X" 或 "password=X" 等
+    for pat in _PASSWORD_VALUE_PATTERNS:
+        for m in re.finditer(pat, description, re.IGNORECASE):
+            value = m.group(3) if m.lastindex and m.lastindex >= 3 else m.group(0)
+            value = value.strip()
+            if not _is_placeholder_or_field_ref(value) and len(value) >= 3:
+                secrets.append({"type": "password", "value": value[:20]})
+                break  # 每种模式只报告一次
+
+    # 2. API Key/Token 检测
+    for pat in _API_KEY_PATTERNS:
+        for m in re.finditer(pat, description, re.IGNORECASE):
+            full = m.group(0)
+            secrets.append({"type": "api_key", "value": full[:30] + ("..." if len(full) > 30 else "")})
+            break
+
+    # 3. 信用卡号检测（Luhn 算法）
+    cc_match = re.search(r'\b(\d[ -]?){13,19}\b', description)
+    if cc_match:
+        digits = re.sub(r'\D', '', cc_match.group(0))
+        if _luhn_check(digits):
+            secrets.append({"type": "credit_card", "value": digits[:4] + "****" + digits[-4:]})
+
+    return secrets
+
+
+def _auto_replace_secrets(description: str, secrets: list[dict]) -> str:
+    """自动将硬编码的敏感值替换为占位符。
+
+    替换规则：
+      - "密码是Abc123" → 移除密码值，建议用占位符
+      - "email=test@example.com" → 替换为 {feishu:邮箱}
+    """
+    result = description
+
+    for s in secrets:
+        if s["type"] == "password":
+            # 替换 "密码是/为/=/: X" 以及 "密码设为/用/换成 X" 模式
+            result = re.sub(
+                r'(密码|password|passwd|pwd)\s*(是|为|=|:|：|用|使用|设为|改成|设置为|设置成|换成)\s*\S+',
+                r'\1 应从飞书取值（请使用 {feishu:shopify密码} 占位符）',
+                result,
+                flags=re.IGNORECASE,
+            )
+        elif s["type"] == "api_key":
+            result = re.sub(
+                r'(api[_\s]?key|apikey|secret|token)\s*(是|为|=|:|：)\s*[a-zA-Z0-9_\-]+',
+                r'\1 应从飞书配置获取（不要硬编码）',
+                result,
+                flags=re.IGNORECASE,
+            )
+
+    return result
+
+
+def scan_safety(description: str) -> ScanResult:
+    """三层安全扫描（新版）。
+
+    返回 ScanResult，包含 level (BLOCK/WARN/ALLOW) 和详细信息。
+
+    与旧版 _scan_safety 的区别：
+      - 旧版：单层正则匹配，遇到"密码"/"删除"/"信用卡"就拦截
+      - 新版：三层意图分析，区分恶意、硬编码、正常操作
+    """
+    # ── TIER 1: 恶意意图检测 ──
+    malicious = _detect_malicious_intent(description)
+    if malicious:
+        return ScanResult(
+            level=ScanLevel.BLOCK,
+            reasons=[f"{malicious['category']}: {malicious['detail']}"],
+            suggestions=["此操作涉及恶意意图，已被安全策略禁止。"],
+        )
+
+    # ── TIER 2: 敏感数据硬编码检测 ──
+    secrets = _detect_hardcoded_secrets(description)
+    if secrets:
+        auto_fixed = _auto_replace_secrets(description, secrets)
+        return ScanResult(
+            level=ScanLevel.WARN,
+            reasons=[f"硬编码的{s['type']}: {s['value']}" for s in secrets],
+            suggestions=[
+                "避免在 prompt 中硬编码敏感数据。",
+                "使用 {feishu:邮箱} / {feishu:shopify密码} 等占位符引用飞书数据。",
+                "系统将在运行时自动从飞书注册表注入真实数据。",
+            ],
+            auto_fixed=auto_fixed if auto_fixed != description else None,
+        )
+
+    # ── TIER 3: 正常业务操作 ──
+    return ScanResult(level=ScanLevel.ALLOW)
+
+
+# 向后兼容：保留旧函数名，内部调用新版
 def _scan_safety(description: str) -> tuple[bool, list[str], list[str]]:
+    """向后兼容的旧接口。
+
+    返回: (blocked: bool, danger_reasons: list[str], warnings: list[str])
+
+    注意：旧版的 warnings 在新版中已合并进 TIER1/TIER2，此处仅做转换。
     """
-    返回:
-        (blocked: bool, danger_reasons: list[str], warnings: list[str])
-    """
-    dangers = [reason for pattern, reason in DANGEROUS_PATTERNS
-               if re.search(pattern, description, re.IGNORECASE)]
-    warnings = [reason for pattern, reason in WARNING_PATTERNS
-                if re.search(pattern, description, re.IGNORECASE)]
-    return (len(dangers) > 0, dangers, warnings)
+    result = scan_safety(description)
+    if result.level == ScanLevel.BLOCK:
+        return (True, result.reasons, [])
+    elif result.level == ScanLevel.WARN:
+        return (False, [], result.reasons)
+    else:
+        return (False, [], [])
 
 
 # ── DeepSeek API 调用 + 重试 ─────────────────────────────────
@@ -390,18 +639,26 @@ class PhaseBuilder:
             [{"name": "...", "task": "...", "max_steps": N}, ...]
 
         Raises:
-            ValueError: 安全扫描阻挡
+            ValueError: 安全扫描阻挡（TIER 1 恶意意图）
             RuntimeError: API 调用失败
         """
-        # 1. 安全扫描
-        blocked, dangers, warnings = _scan_safety(description)
-        if blocked:
+        # 1. 三层安全扫描
+        scan = scan_safety(description)
+
+        if scan.level == ScanLevel.BLOCK:
             raise ValueError(
-                f"🛑 安全扫描拦截！检测到高危词汇: {', '.join(dangers)}"
+                f"🛑 安全拦截！\n"
+                f"   原因: {'; '.join(scan.reasons)}\n"
+                f"   建议: {'; '.join(scan.suggestions)}"
             )
 
-        if warnings:
-            print(f"   ⚠️  警告标记: {', '.join(warnings)}", flush=True)
+        if scan.level == ScanLevel.WARN:
+            print(f"   ⚠️  安全警告: {'; '.join(scan.reasons)}", flush=True)
+            for s in scan.suggestions:
+                print(f"   💡 {s}", flush=True)
+            if scan.auto_fixed and scan.auto_fixed != description:
+                print(f"   🔧 已自动替换为占位符", flush=True)
+                description = scan.auto_fixed
 
         # 2. 缓存查询
         if not self.no_cache:
@@ -538,29 +795,36 @@ def _cli_main() -> None:
 
     # Dry-run: 只扫描
     if args.dry_run:
-        blocked, dangers, warnings = _scan_safety(description)
+        scan = scan_safety(description)
         if not args.json_only:
             print(f"📝 任务描述: {description[:100]}...")
-            print(f"🔍 安全扫描结果:")
-            if blocked:
-                print(f"   🛑 拦截！高危词: {', '.join(dangers)}")
+            print(f"🔍 三层安全扫描结果:")
+            if scan.level == ScanLevel.BLOCK:
+                print(f"   🔴 拦截 (TIER 1): {'; '.join(scan.reasons)}")
+            elif scan.level == ScanLevel.WARN:
+                print(f"   🟡 警告 (TIER 2): {'; '.join(scan.reasons)}")
+                if scan.auto_fixed:
+                    print(f"   🔧 建议修改为: {scan.auto_fixed[:120]}...")
             else:
-                print(f"   ✅ 未检测到高危词汇")
-            if warnings:
-                print(f"   ⚠️  警告: {', '.join(warnings)}")
-        if blocked:
+                print(f"   🟢 安全 (TIER 3): 正常业务操作")
+        if scan.level == ScanLevel.BLOCK:
             sys.exit(1)
         print("✅ Dry-run 通过")
         return
 
     # 安全扫描
-    blocked, dangers, warnings = _scan_safety(description)
+    scan = scan_safety(description)
     if not args.json_only:
-        print(f"🔍 安全扫描...")
-        if warnings:
-            print(f"   ⚠️  警告标记: {', '.join(warnings)}")
-    if blocked:
-        print(f"🛑 安全扫描拦截！检测到高危词汇: {', '.join(dangers)}")
+        print(f"🔍 三层安全扫描...")
+        if scan.level == ScanLevel.WARN:
+            print(f"   🟡 警告: {'; '.join(scan.reasons)}")
+            for s in scan.suggestions:
+                print(f"   💡 {s}")
+            if scan.auto_fixed and scan.auto_fixed != description:
+                print(f"   🔧 已自动替换为占位符")
+                description = scan.auto_fixed
+    if scan.level == ScanLevel.BLOCK:
+        print(f"🛑 安全拦截: {'; '.join(scan.reasons)}")
         sys.exit(1)
 
     # 检查缓存
